@@ -1,8 +1,7 @@
 use crate::endpoint::ErrorInner;
 use crate::endpoint::context::ContextInternalInner;
 use restate_sdk_shared_core::{
-    AwaitResponse, Error as CoreError, NotificationHandle, TerminalFailure, UnresolvedFuture, VM,
-    Value,
+    AwaitResponse, NotificationHandle, TerminalFailure, UnresolvedFuture, VM, Value,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -70,31 +69,15 @@ impl Future for VmAsyncResultPollFuture {
                     self.state = Some(AsyncResultPollState::PollProgress { ctx, handle });
                 }
                 AsyncResultPollState::WaitingInput { ctx, handle } => {
-                    let mut inner_lock = must_lock!(ctx);
+                    let poll_read = must_lock!(ctx).poll_read_input(cx);
 
-                    let read_result = match inner_lock.read.poll_recv(cx) {
-                        Poll::Ready(t) => t,
-                        Poll::Pending => {
-                            // Still need to wait for input
-                            drop(inner_lock);
-                            self.state = Some(AsyncResultPollState::WaitingInput { ctx, handle });
-                            return Poll::Pending;
-                        }
-                    };
-
-                    // Pass read result to VM
-                    match read_result {
-                        Some(Ok(b)) => inner_lock.vm.notify_input(b),
-                        Some(Err(e)) => inner_lock.vm.notify_error(
-                            CoreError::new(500u16, format!("Error when reading the body {e:?}",)),
-                            None,
-                        ),
-                        None => inner_lock.vm.notify_input_closed(),
-                    }
-
-                    // It's time to poll progress again
-                    drop(inner_lock);
+                    // Either we got new input, or we're waiting for it.
+                    // In both cases, check with the VM first when polled again:
+                    // another future might have read the input carrying our notification.
                     self.state = Some(AsyncResultPollState::PollProgress { ctx, handle });
+                    if poll_read.is_pending() {
+                        return Poll::Pending;
+                    }
                 }
                 AsyncResultPollState::PollProgress { ctx, handle } => {
                     let mut inner_lock = must_lock!(ctx);

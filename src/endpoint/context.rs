@@ -26,7 +26,7 @@ use std::marker::PhantomData;
 use std::mem;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, ready};
+use std::task::{Context, Poll, Waker, ready};
 use std::time::Duration;
 // wasm32-unknown-unknown has no std clock: `std::time::{Instant, SystemTime}::now()`
 // abort with "time not implemented on this platform". `web_time` exposes the same API
@@ -45,6 +45,11 @@ pub struct ContextInternalInner {
     /// We remember here the state of the span replaying field state, because setting it might be expensive (it's guarded behind locks and other stuff).
     /// For details, see [ContextInternalInner::maybe_flip_span_replaying_field]
     pub(super) span_replaying_field_state: bool,
+
+    /// Wakers of the futures waiting for input. The input stream only wakes the last waker that polled it,
+    /// and the input read by one future might carry the notifications another future is waiting for,
+    /// so whoever reads the input wakes all of them up. See [ContextInternalInner::poll_read_input].
+    input_waiters: Vec<Waker>,
 }
 
 impl ContextInternalInner {
@@ -60,7 +65,38 @@ impl ContextInternalInner {
             write,
             handler_state,
             span_replaying_field_state: false,
+            input_waiters: vec![],
         }
+    }
+
+    /// Read the next input chunk and pass it to the VM.
+    ///
+    /// When this returns [Poll::Ready], the caller and all the other futures waiting for input
+    /// must check again with the VM whether their notification is now available.
+    pub(super) fn poll_read_input(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        let read_result = match self.read.poll_recv(cx) {
+            Poll::Ready(r) => r,
+            Poll::Pending => {
+                if !self.input_waiters.iter().any(|w| w.will_wake(cx.waker())) {
+                    self.input_waiters.push(cx.waker().clone());
+                }
+                return Poll::Pending;
+            }
+        };
+
+        match read_result {
+            Some(Ok(b)) => self.vm.notify_input(b),
+            Some(Err(e)) => self.vm.notify_error(
+                CoreError::new(500u16, format!("Error when reading the body {e:?}",)),
+                None,
+            ),
+            None => self.vm.notify_input_closed(),
+        }
+
+        for waker in self.input_waiters.drain(..) {
+            waker.wake();
+        }
+        Poll::Ready(())
     }
 
     pub(super) fn fail(&mut self, e: Error) {
